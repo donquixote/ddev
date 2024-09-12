@@ -16,6 +16,8 @@ To add custom configuration or additional services to your project, create docke
 
     The main docker-compose file is `.ddev/.ddev-docker-compose-base.yaml`, reserved exclusively for DDEV’s use. It’s overwritten every time a project is started, so any edits will be lost. If you need to override configuration provided by `.ddev/.ddev-docker-compose-base.yaml`, use an additional `docker-compose.<whatever>.yaml` file instead.
 
+A custom `docker-compose.*.yaml` file can alter the definitions of existing services, or it can be used to declare entirely new services.
+
 ## `docker-compose.*.yaml` Examples
 
 * Expose an additional port 9999 to host port 9999, in a file perhaps called `docker-compose.ports.yaml`:
@@ -53,7 +55,7 @@ To better understand how DDEV parses your custom docker-compose files, run `ddev
 When defining additional services for your project, we recommend following these conventions to ensure DDEV handles your service the same way DDEV handles default services.
 
 * The container name should be `ddev-${DDEV_SITENAME}-<servicename>`. This ensures the auto-generated [Traefik routing configuration](./traefik-router.md#project-traefik-configuration) matches your custom service.
-* Provide containers with required labels:
+* Provide containers with required labels. These are used by DDEV to target all containers that belong to a project.
 
     ```yaml
         labels:
@@ -70,6 +72,117 @@ When defining additional services for your project, we recommend following these
         * `VIRTUAL_HOST=$DDEV_HOSTNAME` You can set a subdomain with `VIRTUAL_HOST=mysubdomain.$DDEV_HOSTNAME`. You can also specify an arbitrary hostname like `VIRTUAL_HOST=extra.ddev.site`.
         * `HTTP_EXPOSE=portNum` The `hostPort:containerPort` convention may be used here to expose a container’s port to a different external port. To expose multiple ports for a single container, define the ports as comma-separated values.
         * `HTTPS_EXPOSE=<exposedPortNumber>:portNum` This will expose an HTTPS interface on `<exposedPortNumber>` to the host (and to the `web` container) as `https://<project>.ddev.site:exposedPortNumber`. To expose multiple ports for a single container, use comma-separated definitions, as in `HTTPS_EXPOSE=9998:80,9999:81`, which would expose HTTP port 80 from the container as `https://<project>.ddev.site:9998` and HTTP port 81 from the container as `https://<project>.ddev.site:9999`.
+
+## Service urls and ports
+
+Services with an HTTP API may have different urls from the host system and from other containers.
+
+You can run `ddev describe` to see a summary of urls for all services in the project.
+
+From other containers, a container is typically accessible by `http://<service name>`.
+These urls do not work from the host system, and they generally don't support https.
+
+```shell
+# Access to "someservice" from "web" service.
+ddev exec curl http://someservice  # -> OK
+# Access to "someservice" from "db" service (assuming one exists in the project).
+ddev exec -s db curl http://someservice  # -> OK
+# Attempt to access "someservice" from "web" service with https.
+ddev exec curl http://someservice  # -> FAIL, "SSL routines::wrong version number".
+```
+You can try this by running `ddev exec -s <service name A> curl http://<service name B>/<url path>`.
+
+### Host-facing url with custom port
+
+To make an additional container accessible from the host system, additional configuration is needed.
+Typically this is done with variables in `environment:`, as below:
+
+```yaml
+services:
+  <service name>:
+    environment:
+      VIRTUAL_HOST: $DDEV_HOSTNAME
+      HTTP_EXPOSE: 9998:<internal port>
+      HTTPS_EXPOSE: 9999:<internal port>
+```
+
+_Note that these are not actually intended to be read as environment variables by the container. The fact that these settings are under the `environment:` key has historic reasons. Instead, they are intended to be read when the traefik configuration is generated._ 
+
+With this configuration, the container will be accessible at `http://<project name>.ddev.site:9998` and `https://<project name>.ddev.site:9999`.
+This means it uses the same url as the main "web" service, just with different ports.
+
+The `<internal port>` should be the same for `HTTP_EXPOSE` and `HTTPS_EXPOSE`, and has to match the port exposed by the docker image.
+It is assumed that the target port (here `9998` and `9999`) need to be different for http and https. You can try to use the same, if it works. 
+
+If `VIRTUAL_HOST` is just `$DDEV_HOSTNAME`, the same url will also work from the "web" container, but not from other containers.
+
+```shell
+# Access from host system.
+curl http://<project name>.ddev.site:9998  # -> OK
+curl https://<project name>.ddev.site:9999  # -> OK
+# Access from "web" container.
+ddev exec curl http://<project name>.ddev.site:9998  # -> OK
+ddev exec curl https://<project name>.ddev.site:9998  # -> OK
+# No access from "db" container (assuming one exists in the project).
+ddev exec -s db curl http://<project name>.ddev.site:9998  # -> FAIL, "Connection refused"
+ddev exec -s db curl https://<project name>.ddev.site:9998  # -> FAIL, "Connection refused"
+```
+
+### Host-facing url with subdomain or custom host name
+
+An additional service can use a subdomain or an entirely different host name by providing a different value for the `VIRTUAL_HOST` environment variable.
+By doing this, one can now use the default ports `80` and `443` for http and https, so that the url can be visited without an explicit port.
+
+```yaml
+services:
+  <service name>:
+    environment:
+      VIRTUAL_HOST: someservice.$DDEV_HOSTNAME
+      # The ports mapping below could use 80 and 443, so that urls don't need an
+      # explicit port.
+      # However, the explanations below are more clear with custom ports.
+      HTTP_EXPOSE: 9998:<internal port>
+      HTTPS_EXPOSE: 9999:<internal port>
+```
+
+By default, the custom or subdomain url will only be accessible from the host system.
+
+```shell
+# Access from host system.
+curl http://someservice.<project name>.ddev.site:9998  # -> OK
+curl https://someservice.<project name>.ddev.site:9999  # -> OK
+# No access from "web" container.
+ddev exec curl http://someservice.<project name>.ddev.site:9998  # -> FAIL, "Couldn't connect to server"
+ddev exec curl https://someservice.<project name>.ddev.site:9999  # -> FAIL, "Couldn't connect to server"
+```
+
+To make the url available from other containers such as "web", the following configuration should be added.
+This can happen in the same `docker-compose.*.yaml` that defines the new service.
+
+```yaml
+services:
+  # Allow 'web' container to access the new url.
+  web:
+    external_links:
+      # The url should match the VIRTUAL_HOST from the other service.
+      - ddev-router:someservice.$DDEV_HOSTNAME.x
+  # Allow 'db' container to access the new url.
+  db:
+    external_links:
+      # Using DDEV_SITENAME and DDEV_TLD is the same as DDEV_HOSTNAME.
+      # The curly braces are optional.
+      - ddev-router:someservice.$DDEV_SITENAME.${DDEV_TLD}
+  someservice:
+    environment:
+      VIRTUAL_HOST: someservice.$DDEV_HOSTNAME
+      HTTP_EXPOSE: 9998:<internal port>
+      HTTPS_EXPOSE: 9999:<internal port>
+```
+
+
+
+
+
 
 ## Interacting with Additional Services
 
